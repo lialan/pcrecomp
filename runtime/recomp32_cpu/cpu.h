@@ -57,6 +57,9 @@ typedef struct {
     int      fpu_top;
     /* SSE: xmm0..xmm7. A 32-bit target has no xmm8-15. */
     XMM      xmm[8];
+    /* MMX: mm0..mm7. On hardware they alias the x87 registers; nothing lifted
+     * here mixes the two without an emms between, so they are kept apart. */
+    uint64_t mm[8];
     uint32_t fpu_sw;   /* status word: only C0/C1/C2/C3 condition bits modelled */
     /* Segment registers: stored, but NOT used in address computation. The
      * memory model below is flat - a register holds a real 32-bit address - so
@@ -77,13 +80,49 @@ typedef struct {
 #define SET8H(r, v)   ((r) = ((r) & 0xFFFF00FFu) | ((uint32_t)(uint8_t)(v) << 8))
 #define SET16(r, v)   ((r) = ((r) & 0xFFFF0000u) | (uint16_t)(v))
 
-/* ---- memory access: register holds a real 32-bit address ---- */
-static inline uint8_t  rd8 (uint32_t a) { return *(uint8_t  *)(uintptr_t)a; }
-static inline uint16_t rd16(uint32_t a) { return *(uint16_t *)(uintptr_t)a; }
-static inline uint32_t rd32(uint32_t a) { return *(uint32_t *)(uintptr_t)a; }
-static inline void wr8 (uint32_t a, uint8_t  v) { *(uint8_t  *)(uintptr_t)a = v; }
-static inline void wr16(uint32_t a, uint16_t v) { *(uint16_t *)(uintptr_t)a = v; }
-static inline void wr32(uint32_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v; }
+/* ---- memory access ----
+ *
+ * A 32-bit host: a register holds a real address. A 64-bit host (define
+ * RECOMP_GUEST_BASE): a register holds an offset into one reserved 4 GB window
+ * at g_guest_base, so guest address 0x08048000 is g_guest_base + 0x08048000.
+ * Every lifted memory access goes through G2H, so the generated code is the
+ * same either way. */
+#ifdef RECOMP_GUEST_BASE
+extern uint8_t *g_guest_base;
+#define G2H(a) ((void *)(g_guest_base + (uint32_t)(a)))
+#else
+#define G2H(a) ((void *)(uintptr_t)(uint32_t)(a))
+#endif
+static inline uint8_t  rd8 (uint32_t a) { return *(uint8_t  *)G2H(a); }
+static inline uint16_t rd16(uint32_t a) { uint16_t v; memcpy(&v, G2H(a), 2); return v; }
+static inline uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, G2H(a), 4); return v; }
+/* ---- MMX lanes: what CRI's ISSE IDCT uses, nothing more ---- */
+static inline uint64_t rdmm(uint32_t a) { uint64_t v; memcpy(&v, G2H(a), 8); return v; }
+static inline int16_t mmw(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
+static inline int32_t mmd(uint64_t v, int i) { return (int32_t)(v >> (32 * i)); }
+static inline uint64_t mm_w4(int32_t w0, int32_t w1, int32_t w2, int32_t w3)
+{ return (uint64_t)(uint16_t)w0 | (uint64_t)(uint16_t)w1 << 16 | (uint64_t)(uint16_t)w2 << 32 | (uint64_t)(uint16_t)w3 << 48; }
+static inline uint64_t mm_d2(int32_t d0, int32_t d1) { return (uint64_t)(uint32_t)d0 | (uint64_t)(uint32_t)d1 << 32; }
+static inline int32_t mm_sat16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+static inline uint64_t mmx_paddd(uint64_t a, uint64_t b) { return mm_d2((int32_t)((uint32_t)mmd(a,0) + (uint32_t)mmd(b,0)), (int32_t)((uint32_t)mmd(a,1) + (uint32_t)mmd(b,1))); }
+static inline uint64_t mmx_psubd(uint64_t a, uint64_t b) { return mm_d2((int32_t)((uint32_t)mmd(a,0) - (uint32_t)mmd(b,0)), (int32_t)((uint32_t)mmd(a,1) - (uint32_t)mmd(b,1))); }
+static inline uint64_t mmx_paddsw(uint64_t a, uint64_t b) { return mm_w4(mm_sat16(mmw(a,0)+mmw(b,0)), mm_sat16(mmw(a,1)+mmw(b,1)), mm_sat16(mmw(a,2)+mmw(b,2)), mm_sat16(mmw(a,3)+mmw(b,3))); }
+static inline uint64_t mmx_psubsw(uint64_t a, uint64_t b) { return mm_w4(mm_sat16(mmw(a,0)-mmw(b,0)), mm_sat16(mmw(a,1)-mmw(b,1)), mm_sat16(mmw(a,2)-mmw(b,2)), mm_sat16(mmw(a,3)-mmw(b,3))); }
+static inline uint64_t mmx_pmulhw(uint64_t a, uint64_t b) { return mm_w4((mmw(a,0)*mmw(b,0)) >> 16, (mmw(a,1)*mmw(b,1)) >> 16, (mmw(a,2)*mmw(b,2)) >> 16, (mmw(a,3)*mmw(b,3)) >> 16); }
+static inline uint64_t mmx_pmaddwd(uint64_t a, uint64_t b)
+{   /* the one overflow case, 0x8000*0x8000*2, wraps on hardware too */
+    return mm_d2((int32_t)((uint32_t)(mmw(a,0)*mmw(b,0)) + (uint32_t)(mmw(a,1)*mmw(b,1))),
+                 (int32_t)((uint32_t)(mmw(a,2)*mmw(b,2)) + (uint32_t)(mmw(a,3)*mmw(b,3)))); }
+static inline uint64_t mmx_packssdw(uint64_t a, uint64_t b) { return mm_w4(mm_sat16(mmd(a,0)), mm_sat16(mmd(a,1)), mm_sat16(mmd(b,0)), mm_sat16(mmd(b,1))); }
+static inline uint64_t mmx_psrad(uint64_t a, uint64_t n) { int k = n > 31 ? 31 : (int)n; return mm_d2(mmd(a,0) >> k, mmd(a,1) >> k); }
+static inline uint64_t mmx_psraw(uint64_t a, uint64_t n) { int k = n > 15 ? 15 : (int)n; return mm_w4(mmw(a,0) >> k, mmw(a,1) >> k, mmw(a,2) >> k, mmw(a,3) >> k); }
+static inline uint64_t mmx_por(uint64_t a, uint64_t b) { return a | b; }
+static inline uint64_t mmx_pshufw(uint64_t b, unsigned imm) { return mm_w4(mmw(b, imm & 3), mmw(b, (imm >> 2) & 3), mmw(b, (imm >> 4) & 3), mmw(b, (imm >> 6) & 3)); }
+static inline uint64_t mmx_pinsrw(uint64_t a, uint32_t v, unsigned imm) { int i = imm & 3; return (a & ~(0xFFFFull << (16 * i))) | (uint64_t)(uint16_t)v << (16 * i); }
+
+static inline void wr8 (uint32_t a, uint8_t  v) { *(uint8_t  *)G2H(a) = v; }
+static inline void wr16(uint32_t a, uint16_t v) { memcpy(G2H(a), &v, 2); }
+static inline void wr32(uint32_t a, uint32_t v) { memcpy(G2H(a), &v, 4); }
 
 /* ---- EFLAGS pack/unpack (modelled bits only) ---- */
 /* `lock`-prefixed read-modify-write.
@@ -99,24 +138,24 @@ static inline void wr32(uint32_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v;
  * sets follows from that. */
 #if defined(_MSC_VER)
 static inline uint32_t atomic_xadd32(uint32_t a, uint32_t v) {
-    return (uint32_t)_InterlockedExchangeAdd((volatile long *)(uintptr_t)a, (long)v);
+    return (uint32_t)_InterlockedExchangeAdd((volatile long *)G2H(a), (long)v);
 }
 static inline uint32_t atomic_cmpxchg32(uint32_t a, uint32_t cmp, uint32_t nv) {
-    return (uint32_t)_InterlockedCompareExchange((volatile long *)(uintptr_t)a,
+    return (uint32_t)_InterlockedCompareExchange((volatile long *)G2H(a),
                                                  (long)nv, (long)cmp);
 }
 static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
-    return (uint32_t)_InterlockedExchange((volatile long *)(uintptr_t)a, (long)v);
+    return (uint32_t)_InterlockedExchange((volatile long *)G2H(a), (long)v);
 }
 #else
 static inline uint32_t atomic_xadd32(uint32_t a, uint32_t v) {
-    return __sync_fetch_and_add((volatile uint32_t *)(uintptr_t)a, v);
+    return __sync_fetch_and_add((volatile uint32_t *)G2H(a), v);
 }
 static inline uint32_t atomic_cmpxchg32(uint32_t a, uint32_t cmp, uint32_t nv) {
-    return __sync_val_compare_and_swap((volatile uint32_t *)(uintptr_t)a, cmp, nv);
+    return __sync_val_compare_and_swap((volatile uint32_t *)G2H(a), cmp, nv);
 }
 static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
-    return __sync_lock_test_and_set((volatile uint32_t *)(uintptr_t)a, v);
+    return __sync_lock_test_and_set((volatile uint32_t *)G2H(a), v);
 }
 #endif
 
@@ -149,6 +188,18 @@ static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp)
  * lines becomes __fastfail in a release build, which no handler sees. */
 #ifndef RECOMP_TODO
 #define RECOMP_TODO(va, text) abort()
+#endif
+
+/* fs:/gs: segment-relative reads. MSVC has intrinsics for the Win32 TIB; a
+ * Linux/i386 guest only reaches these from data the disassembler took for
+ * code, so elsewhere they report through RECOMP_TODO instead of guessing. */
+#if !defined(_MSC_VER)
+static inline uint8_t  __readfsbyte (uint32_t a) { RECOMP_TODO(a, "fs: read"); return 0; }
+static inline uint16_t __readfsword (uint32_t a) { RECOMP_TODO(a, "fs: read"); return 0; }
+static inline uint32_t __readfsdword(uint32_t a) { RECOMP_TODO(a, "fs: read"); return 0; }
+static inline void __writefsbyte (uint32_t a, uint8_t  v) { (void)v; RECOMP_TODO(a, "fs: write"); }
+static inline void __writefsword (uint32_t a, uint16_t v) { (void)v; RECOMP_TODO(a, "fs: write"); }
+static inline void __writefsdword(uint32_t a, uint32_t v) { (void)v; RECOMP_TODO(a, "fs: write"); }
 #endif
 
 /* ---- absolute image references: abs VA at preferred base -> live address ---- */
@@ -342,16 +393,16 @@ static inline double fpop(CPU *c) { double v = c->st[c->fpu_top]; c->fpu_top = (
 static inline double *fst(CPU *c, int i) { return &c->st[(c->fpu_top + i) & 7]; }
 
 /* float/double/int memory operands (memcpy avoids alignment/aliasing issues) */
-static inline double rdf32(uint32_t a) { float  f; memcpy(&f, (void *)(uintptr_t)a, 4); return (double)f; }
-static inline double rdf64(uint32_t a) { double d; memcpy(&d, (void *)(uintptr_t)a, 8); return d; }
-static inline double rdi16(uint32_t a) { int16_t i; memcpy(&i, (void *)(uintptr_t)a, 2); return (double)i; }
-static inline double rdi32(uint32_t a) { int32_t i; memcpy(&i, (void *)(uintptr_t)a, 4); return (double)i; }
-static inline double rdi64(uint32_t a) { int64_t i; memcpy(&i, (void *)(uintptr_t)a, 8); return (double)i; }
-static inline void   wrf32(uint32_t a, double v) { float  f = (float)v; memcpy((void *)(uintptr_t)a, &f, 4); }
-static inline void   wrf64(uint32_t a, double v) { memcpy((void *)(uintptr_t)a, &v, 8); }
-static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyint(v); memcpy((void *)(uintptr_t)a, &i, 4); }
-static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); memcpy((void *)(uintptr_t)a, &i, 2); }
-static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); memcpy((void *)(uintptr_t)a, &i, 8); }
+static inline double rdf32(uint32_t a) { float  f; memcpy(&f, G2H(a), 4); return (double)f; }
+static inline double rdf64(uint32_t a) { double d; memcpy(&d, G2H(a), 8); return d; }
+static inline double rdi16(uint32_t a) { int16_t i; memcpy(&i, G2H(a), 2); return (double)i; }
+static inline double rdi32(uint32_t a) { int32_t i; memcpy(&i, G2H(a), 4); return (double)i; }
+static inline double rdi64(uint32_t a) { int64_t i; memcpy(&i, G2H(a), 8); return (double)i; }
+static inline void   wrf32(uint32_t a, double v) { float  f = (float)v; memcpy(G2H(a), &f, 4); }
+static inline void   wrf64(uint32_t a, double v) { memcpy(G2H(a), &v, 8); }
+static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyint(v); memcpy(G2H(a), &i, 4); }
+static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); memcpy(G2H(a), &i, 2); }
+static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); memcpy(G2H(a), &i, 8); }
 
 /* fcom/fcomp: set C3/C2/C0 (st0 vs v). Cleared C1. */
 static inline void fcompare(CPU *c, double a, double b) {
@@ -390,12 +441,12 @@ static inline void do_sahf(CPU *c, uint8_t ah) {
 /* Memory operands. Separate from the x87 rdf32/rdf64 above because those
  * widen to double for the 80-bit stack, and these must not. memcpy because an
  * SSE memory operand is frequently unaligned (movups exists for a reason). */
-static inline float  rdss(uint32_t a) { float  f; memcpy(&f, (void *)(uintptr_t)a, 4); return f; }
-static inline double rdsd(uint32_t a) { double d; memcpy(&d, (void *)(uintptr_t)a, 8); return d; }
-static inline XMM    rdxm(uint32_t a) { XMM x;    memcpy(&x, (void *)(uintptr_t)a, 16); return x; }
-static inline void   wrss(uint32_t a, float  v) { memcpy((void *)(uintptr_t)a, &v, 4); }
-static inline void   wrsd(uint32_t a, double v) { memcpy((void *)(uintptr_t)a, &v, 8); }
-static inline void   wrxm(uint32_t a, XMM    v) { memcpy((void *)(uintptr_t)a, &v, 16); }
+static inline float  rdss(uint32_t a) { float  f; memcpy(&f, G2H(a), 4); return f; }
+static inline double rdsd(uint32_t a) { double d; memcpy(&d, G2H(a), 8); return d; }
+static inline XMM    rdxm(uint32_t a) { XMM x;    memcpy(&x, G2H(a), 16); return x; }
+static inline void   wrss(uint32_t a, float  v) { memcpy(G2H(a), &v, 4); }
+static inline void   wrsd(uint32_t a, double v) { memcpy(G2H(a), &v, 8); }
+static inline void   wrxm(uint32_t a, XMM    v) { memcpy(G2H(a), &v, 16); }
 
 /* MOVSS/MOVSD loading from memory zero the rest of the register; the
  * register-to-register forms leave the high lanes alone. Getting that
@@ -484,7 +535,7 @@ static inline uint32_t bit_reg_op(CPU *c, uint32_t *r, uint32_t idx, int op)
 static inline double rdf80(uint32_t a)
 {
     unsigned char b[10];
-    memcpy(b, (void *)(uintptr_t)a, 10);
+    memcpy(b, G2H(a), 10);
 
     uint64_t mant;
     uint16_t se;
@@ -524,7 +575,7 @@ static inline void wrf80(uint32_t a, double v)
     }
     memcpy(b, &mant, 8);
     memcpy(b + 8, &se, 2);
-    memcpy((void *)(uintptr_t)a, b, 10);
+    memcpy(G2H(a), b, 10);
 }
 
 /* FPREM: the remainder of st0/st1 with the quotient truncated toward zero,

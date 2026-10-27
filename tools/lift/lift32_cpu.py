@@ -375,6 +375,9 @@ class Lifter:
 
         if m[0] == "f":
             return self.fpu(insn)
+        mmx = self.mmx(insn)
+        if mmx is not None:
+            return mmx
         if self.is_sse(insn):
             return self.sse(insn)
 
@@ -772,9 +775,16 @@ class Lifter:
                 src = self._fmem(insn, memop, "f"); dst = "(*fst(c, 0))"
                 expr = f"{src} {opc} {dst}" if rev else f"{dst} {opc} {src}"
                 return [f"*fst(c, 0) = {expr};"]
-            # register form: default dst st(0) when single operand
+            # register form. Capstone gives the popping forms a single operand,
+            # `fdivp st(i)`, but that one is the DESTINATION: st(i) = st(i) OP
+            # st(0), then pop. Only the non-popping `fdiv st(i)` computes into
+            # st(0). Reading both the same way computes into st(0), which the
+            # pop then discards - CRI's dB-to-gain `pow(10, dB / 20)` lost its
+            # division by 20 and every sound played at near-zero gain.
             if len(ops) == 2:
                 a = self._st_idx(ops[0]); b = self._st_idx(ops[1])
+            elif pops:
+                a = self._st_idx(ops[0]) if ops else 1; b = 0
             else:
                 a = 0; b = self._st_idx(ops[0]) if ops else 1
             dst = f"(*fst(c, {a}))"; src = f"(*fst(c, {b}))"
@@ -840,6 +850,51 @@ class Lifter:
         if not name.startswith("xmm") or not name[3:].isdigit():
             raise NotImplementedError("not an xmm operand: %s" % name)
         return int(name[3:])
+
+    def _is_mm(self, op):
+        if op.type != X86_OP_REG: return False
+        n = self.md.reg_name(op.reg)
+        return n.startswith("mm") and n[2:].isdigit()
+
+    def mmx(self, insn):
+        """MMX on mm0-7: the moves, emms, and the integer ops CRI's Sofdec
+        IDCT (DCT_IsseTrans) is built from. Its Linux build has no C IDCT to
+        fall back to, so these are needed for any movie to decode. Anything
+        else MMX keeps its TODO."""
+        m, ops = insn.mnemonic, insn.operands
+        if m == "emms":
+            return []
+        if not any(self._is_mm(o) for o in ops):
+            return None
+        def mmsrc(op):
+            return f"c->mm[{self._mi(op)}]" if self._is_mm(op) else f"rdmm({self.addr_expr(insn, op)})"
+        if m in ("paddd", "psubd", "paddsw", "psubsw", "pmulhw", "pmaddwd", "packssdw", "por"):
+            n = self._mi(ops[0])
+            return [f"c->mm[{n}] = mmx_{m}(c->mm[{n}], {mmsrc(ops[1])});"]
+        if m in ("psrad", "psraw"):
+            n = self._mi(ops[0])
+            cnt = str(ops[1].imm) if ops[1].type == X86_OP_IMM else mmsrc(ops[1])
+            return [f"c->mm[{n}] = mmx_{m}(c->mm[{n}], {cnt});"]
+        if m == "pshufw":
+            return [f"c->mm[{self._mi(ops[0])}] = mmx_pshufw({mmsrc(ops[1])}, {ops[2].imm & 0xFF}u);"]
+        if m == "pinsrw":
+            n = self._mi(ops[0])
+            return [f"c->mm[{n}] = mmx_pinsrw(c->mm[{n}], (uint32_t)({self.src(insn, ops[1])}), {ops[2].imm & 0xFF}u);"]
+        if m not in ("movq", "movd"):
+            return None
+        d, s = ops
+        if m == "movq":
+            if self._is_mm(d) and self._is_mm(s):
+                return [f"c->mm[{self._mi(d)}] = c->mm[{self._mi(s)}];"]
+            if self._is_mm(d):
+                return [f"memcpy(&c->mm[{self._mi(d)}], G2H({self.addr_expr(insn, s)}), 8);"]
+            return [f"memcpy(G2H({self.addr_expr(insn, d)}), &c->mm[{self._mi(s)}], 8);"]
+        if self._is_mm(d):                                 # movd mm, r/m32
+            return [f"c->mm[{self._mi(d)}] = (uint32_t)({self.src(insn, s)});"]
+        return [self.dst_write(insn, d, f"(uint32_t)c->mm[{self._mi(s)}]")]
+
+    def _mi(self, op):
+        return int(self.md.reg_name(op.reg)[2:])
 
     def is_sse(self, insn):
         m = insn.mnemonic
