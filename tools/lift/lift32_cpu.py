@@ -101,17 +101,21 @@ SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdq
 # "move string dword"; `movq`/`movd` and every `p*` op below are also MMX, where
 # the operands are mm0-7 and 64 bits wide. Routing these by name alone
 # mistranslates string loops and MMX code into nonsense that still compiles.
-SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pandn"})
+SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pandn",
+                           "paddd", "psubd", "paddw", "pcmpeqd", "psllq", "psrlq", "psrld",
+                           "pinsrw", "pextrw", "punpcklbw", "punpcklwd", "punpckldq", "pmovmskb"})
 
 SSE_MNEMONICS = (
     SSE_MOV128 | SSE_AMBIGUOUS | frozenset(SSE_BITWISE)
-    | frozenset({"movss", "sqrtss", "sqrtsd", "sqrtps",
+    | frozenset({"stmxcsr", "ldmxcsr", "movss", "sqrtss", "sqrtsd", "sqrtps",
                  "shufps", "unpcklps", "unpckhps",
                  "minps", "maxps", "minpd", "maxpd", "minss", "maxss", "minsd", "maxsd",
                  "ucomiss", "comiss", "ucomisd", "comisd",
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
-                 "cvtdq2ps", "cvtps2dq", "cvttps2dq"})
+                 "cvtdq2ps", "cvtps2dq", "cvttps2dq",
+                 "cvtps2pd", "cvtpd2ps", "movlpd", "movhps", "movhlps", "unpcklpd", "unpckhpd",
+                 "pshufd", "pshuflw", "psrldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
@@ -186,7 +190,20 @@ class Lifter:
         targets = []
         if not self.read_va:
             return targets
-        for i in range(256):
+
+        def zeros_ok(i):
+            """A run of null slots inside a table: an arm follows the run. A
+            switch on 0x49..0x6D indexes from the table's base, so the first
+            73 slots are null and the arms come after them."""
+            for k in range(i + 1, i + 160):
+                try:
+                    nxt = int.from_bytes(self.read_va(table_va + 4 * k, 4), "little")
+                except Exception:
+                    return False
+                if nxt:
+                    return self.in_image(nxt)
+            return False
+        for i in range(512):
             try:
                 raw = self.read_va(table_va + 4 * i, 4)
             except Exception:
@@ -194,6 +211,10 @@ class Lifter:
             t = int.from_bytes(raw, "little")
             if self.in_image(t):
                 targets.append(t)
+            elif t == 0 and zeros_ok(i):
+                # An unused slot. The Intel compiler leaves index 0 of a
+                # switch on 1..N as a null; stopping there loses every arm.
+                continue
             else:
                 break
         return targets
@@ -509,6 +530,9 @@ class Lifter:
             cond = self._cond("j" + m[3:])
             if cond is not None:
                 return [self.dst_write(insn, ops[0], f"(({cond}) ? 1 : 0)")]
+        if m == "cpuid":  return ["cpuid(c);"]
+        if m == "rdtsc":  return ["rdtsc(c);"]
+        if m in ("sfence", "lfence", "mfence"): return []
         if m == "pushfd": return ["push32(c, eflags_pack(c));"]
         if m == "popfd":  return ["eflags_unpack(c, pop32(c));"]
         if m == "pushf":  return ["push32(c, eflags_pack(c) & 0xFFFFu);"]
@@ -617,8 +641,10 @@ class Lifter:
                 return [f"goto L_{t.imm:08X};"]
             if ea in self.jumptables:                       # switch via jump table
                 tgts = self.jumptables[ea]
-                addr = self.addr_expr(insn, t)
-                out = [f"{{ uint32_t _jt = rd32({addr});"]
+                if t.type == X86_OP_REG:                    # mov reg, [idx*4 + table]; jmp reg
+                    out = [f"{{ uint32_t _jt = {reg_read(self.md.reg_name(t.reg))};"]
+                else:
+                    out = [f"{{ uint32_t _jt = rd32({self.addr_expr(insn, t)});"]
                 for tv in sorted(set(tgts)):
                     if tv in labels:
                         out.append(f"  if (_jt == GVA(0x{tv:08X})) goto L_{tv:08X};")
@@ -832,6 +858,11 @@ class Lifter:
             if ops and ops[0].type == X86_OP_REG:   # ax
                 return ["SET16(c->eax, (uint16_t)c->fpu_sw);"]
             return [self.wr(insn, ops[0], "(uint16_t)c->fpu_sw")]
+        # FXSAVE/FXRSTOR: the 512-byte FPU+SSE image. Intel's start-up code
+        # saves one to read MXCSR_MASK, which says whether the CPU supports
+        # denormals-are-zero, before it sets FTZ/DAZ.
+        if m in ("fxsave", "fxrstor"):
+            return [f"{m}(c, {self.addr_expr(insn, ops[0])});"]
         if m == "fnstcw":
             return [self.wr(insn, ops[0], "0x027Fu")]   # default control word
         if m in ("fldcw", "fwait", "wait", "fnclex", "fclex", "fninit"):
@@ -924,6 +955,15 @@ class Lifter:
         ops = insn.operands
         d = ops[0]
         s = ops[1] if len(ops) > 1 else None
+
+        # MXCSR. The model computes with the host's own rounding (nearest),
+        # so the word is kept for the game to read back and not applied:
+        # FTZ/DAZ only change results in denormals, and the default answer
+        # round-trips what the game set.
+        if m == "stmxcsr":
+            return [self.wr(insn, d, "c->mxcsr")]
+        if m == "ldmxcsr":
+            return [f"c->mxcsr = {self.src(insn, d)};"]
 
         # ---- scalar moves ----
         # Loading from memory zeroes the rest of the register; the
@@ -1063,6 +1103,91 @@ class Lifter:
         if m == "cvtsd2ss":
             return [f"c->xmm[{self._xi(d)}].f32[0] = (float)({self._sd(insn, s)});"]
 
+        # ---- the SSE2/SSE3 the Intel compiler vectorises with ----
+        # (The House of the Dead 4.) 64-bit memory halves go through
+        # rdmm/wrmm; a register source is the whole register.
+        def x(op): return self._xm(insn, op)
+        def lo64(op):
+            return f"c->xmm[{self._xi(op)}].u64[0]" if self._is_xmm(op) else f"rdmm({self.addr_expr(insn, op)})"
+        if m == "lddqu":
+            return [f"c->xmm[{self._xi(d)}] = {x(s)};"]
+        if m == "cvtps2pd":
+            n = self._xi(d)
+            src = f"c->xmm[{self._xi(s)}]" if self._is_xmm(s) else f"rdxm({self.addr_expr(insn, s)})"
+            return [f"{{ XMM _s = {src}; c->xmm[{n}].f64[0] = _s.f32[0]; c->xmm[{n}].f64[1] = _s.f32[1]; }}"]
+        if m == "cvtpd2ps":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].f32[0] = (float)_s.f64[0];"
+                    f" c->xmm[{n}].f32[1] = (float)_s.f64[1]; c->xmm[{n}].u64[1] = 0; }}"]
+        if m in ("movlpd", "movhps"):
+            half = 0 if m == "movlpd" else 1
+            if self._is_xmm(d):
+                return [f"c->xmm[{self._xi(d)}].u64[{half}] = rdmm({self.addr_expr(insn, s)});"]
+            return [f"wrmm({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}].u64[{half}]);"]
+        if m == "movhlps":
+            return [f"c->xmm[{self._xi(d)}].u64[0] = c->xmm[{self._xi(s)}].u64[1];"]
+        if m == "unpcklpd":
+            return [f"c->xmm[{self._xi(d)}].u64[1] = {lo64(s)};"]
+        if m == "unpckhpd":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].u64[0] = c->xmm[{n}].u64[1]; c->xmm[{n}].u64[1] = _s.u64[1]; }}"]
+        if m == "pshufd":
+            n, imm = self._xi(d), ops[2].imm & 0xFF
+            return ["{ XMM _s = %s; %s }" % (x(s), " ".join(
+                f"c->xmm[{n}].u32[{i}] = _s.u32[{(imm >> (2 * i)) & 3}];" for i in range(4)))]
+        if m == "pshuflw":
+            n, imm = self._xi(d), ops[2].imm & 0xFF
+            return ["{ XMM _s = %s; %s c->xmm[%d].u64[1] = _s.u64[1]; }" % (x(s), " ".join(
+                f"c->xmm[{n}].u16[{i}] = _s.u16[{(imm >> (2 * i)) & 3}];" for i in range(4)), n)]
+        if m == "pinsrw":
+            return [f"c->xmm[{self._xi(d)}].u16[{ops[2].imm & 7}] = (uint16_t)({self.src(insn, s)});"]
+        if m == "pextrw":
+            return [self.dst_write(insn, d, f"(uint32_t)c->xmm[{self._xi(s)}].u16[{ops[2].imm & 7}]")]
+        if m in ("paddd", "psubd", "paddw"):
+            n = self._xi(d)
+            fld, k = ("u16", 8) if m == "paddw" else ("u32", 4)
+            op = "-" if m == "psubd" else "+"
+            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < {k}; _i++)"
+                    f" c->xmm[{n}].{fld}[_i] = ({'uint16_t' if k == 8 else 'uint32_t'})(c->xmm[{n}].{fld}[_i] {op} _s.{fld}[_i]); }}"]
+        if m == "pcmpeqd":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < 4; _i++)"
+                    f" c->xmm[{n}].u32[_i] = c->xmm[{n}].u32[_i] == _s.u32[_i] ? 0xFFFFFFFFu : 0u; }}"]
+        if m in ("psllq", "psrlq", "psrld"):
+            n = self._xi(d)
+            cnt = f"{s.imm & 0xFF}u" if s.type == X86_OP_IMM else f"{x(s)}.u64[0]"
+            if m == "psrld":
+                return [f"{{ uint64_t _n = {cnt}; for (int _i = 0; _i < 4; _i++)"
+                        f" c->xmm[{n}].u32[_i] = sse_srl32(c->xmm[{n}].u32[_i], _n); }}"]
+            fn = "sse_sll64" if m == "psllq" else "sse_srl64"
+            return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].u64[0] = {fn}(c->xmm[{n}].u64[0], _n);"
+                    f" c->xmm[{n}].u64[1] = {fn}(c->xmm[{n}].u64[1], _n); }}"]
+        if m == "psrldq":
+            n, k = self._xi(d), s.imm & 0xFF
+            return [f"{{ XMM _s = c->xmm[{n}]; for (int _i = 0; _i < 16; _i++)"
+                    f" c->xmm[{n}].u8[_i] = _i + {k} < 16 ? _s.u8[_i + {k}] : 0; }}"]
+        if m in ("punpcklbw", "punpcklwd", "punpckldq"):
+            n = self._xi(d)
+            fld, k = {"punpcklbw": ("u8", 8), "punpcklwd": ("u16", 4), "punpckldq": ("u32", 2)}[m]
+            return [f"{{ XMM _d = c->xmm[{n}], _s = {x(s)}; for (int _i = 0; _i < {k}; _i++)"
+                    f" {{ c->xmm[{n}].{fld}[2 * _i] = _d.{fld}[_i]; c->xmm[{n}].{fld}[2 * _i + 1] = _s.{fld}[_i]; }} }}"]
+        if m == "haddps":
+            n = self._xi(d)
+            return [f"{{ XMM _d = c->xmm[{n}], _s = {x(s)};"
+                    f" c->xmm[{n}].f32[0] = _d.f32[0] + _d.f32[1]; c->xmm[{n}].f32[1] = _d.f32[2] + _d.f32[3];"
+                    f" c->xmm[{n}].f32[2] = _s.f32[0] + _s.f32[1]; c->xmm[{n}].f32[3] = _s.f32[2] + _s.f32[3]; }}"]
+        if m == "rcpss":
+            return [f"{self._ss(insn, d)} = 1.0f / {self._ss(insn, s)};"]
+        if m == "rcpps":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < 4; _i++) c->xmm[{n}].f32[_i] = 1.0f / _s.f32[_i]; }}"]
+        if m == "pmovmskb":
+            return [self.dst_write(insn, d, "({ uint32_t _m = 0; for (int _i = 0; _i < 16; _i++)"
+                    f" _m |= (uint32_t)(c->xmm[{self._xi(s)}].u8[_i] >> 7) << _i; _m; }})")]
+        if m == "movmskpd":
+            n = self._xi(s)
+            return [self.dst_write(insn, d, f"(uint32_t)((c->xmm[{n}].u64[0] >> 63) | ((c->xmm[{n}].u64[1] >> 63) << 1))")]
+
         # ---- packed conversions ----
         #
         # All four lanes, which is what a compiler emits for a float4 cast and
@@ -1156,7 +1281,22 @@ class Lifter:
         self.func_start, self.func_end = start, end
         insn_addrs = set(ins.address for ins in insns)   # only these can be goto labels
         labels = set()
+        prev = None
         for ins in insns:
+            # The Intel compiler's switch loads the arm first and jumps through
+            # the register: `mov edx, [eax*4 + table]` then `jmp edx`. Same
+            # table, one instruction later.
+            if (ins.mnemonic == "jmp" and ins.operands and ins.operands[0].type == X86_OP_REG
+                    and prev is not None and prev.mnemonic == "mov" and len(prev.operands) == 2
+                    and prev.operands[0].type == X86_OP_REG and prev.operands[0].reg == ins.operands[0].reg
+                    and prev.operands[1].type == X86_OP_MEM and prev.operands[1].mem.index
+                    and prev.operands[1].mem.scale == 4 and not prev.operands[1].mem.base
+                    and self.in_image(prev.operands[1].mem.disp & 0xffffffff)):
+                tgts = self.resolve_jumptable(prev.operands[1].mem.disp & 0xffffffff)
+                if tgts:
+                    self.jumptables[ins.address] = tgts
+                    labels.update(t for t in tgts if t in insn_addrs)
+            prev = ins
             if ins.mnemonic.startswith("j") or ins.mnemonic in ("loop","loopne","loope","loopz","loopnz","loope"):
                 for op in ins.operands:
                     # only label real instruction boundaries; targets that land

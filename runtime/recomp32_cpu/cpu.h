@@ -45,6 +45,9 @@ typedef union {
     uint32_t u32[4];
     uint64_t u64[2];
     int32_t  i32[4];
+    uint16_t u16[8];
+    int16_t  i16[8];
+    uint8_t  u8[16];
 } XMM;
 
 typedef struct {
@@ -70,6 +73,10 @@ typedef struct {
      * runtime does not have; such code should be caught rather than lifted
      * silently. */
     uint16_t cs, ds, es, fs, gs, ss;
+    /* AC (bit 18) and ID (bit 21): the two EFLAGS bits user mode can toggle.
+     * Kept so the POPFD/PUSHFD probe for CPUID reads back what it wrote. */
+    uint32_t eflags_user;
+    uint32_t mxcsr;    /* stored for read-back only; the host rounds to nearest */
 } CPU;
 
 /* ---- partial register access (preserve unaffected bits, like x86) ---- */
@@ -160,10 +167,11 @@ static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
 #endif
 
 static inline uint32_t eflags_pack(CPU *c) {
-    return 0x202u | (c->cf) | (c->pf << 2) | (c->af << 4) |
+    return 0x202u | c->eflags_user | (c->cf) | (c->pf << 2) | (c->af << 4) |
            (c->zf << 6) | (c->sf << 7) | (c->of << 11);
 }
 static inline void eflags_unpack(CPU *c, uint32_t v) {
+    c->eflags_user = v & 0x240000u;
     c->cf = v & 1; c->pf = (v >> 2) & 1; c->af = (v >> 4) & 1;
     c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->of = (v >> 11) & 1;
 }
@@ -180,6 +188,59 @@ static inline void eflags_unpack(CPU *c, uint32_t v) {
 #endif
 static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
 static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
+
+/* CPUID, answered as the Pentium 4 a Lindbergh board carries: GenuineIntel,
+ * family 15, with SSE3 (Prescott). A game built with the Intel compiler checks the vendor
+ * and the features before main and refuses to run on anything else; the host's
+ * real answer (an ARM Mac has none) is not the machine the game was built for. */
+static inline void cpuid(CPU *c) {
+    static const char brand[48] = "Intel(R) Pentium(R) 4 CPU 3.00GHz";
+    uint32_t leaf = c->eax;
+    c->eax = c->ebx = c->ecx = c->edx = 0;
+    switch (leaf) {
+    case 0: c->eax = 2; c->ebx = 0x756E6547u; c->edx = 0x49656E69u; c->ecx = 0x6C65746Eu; break;
+    case 1: c->eax = 0x00000F41u; c->ebx = 0x00010800u; c->ecx = 0x0000441Du; c->edx = 0xBFEBFBFFu; break;
+    case 2: c->eax = 0x665B5001u; c->edx = 0x007A7040u; break;
+    case 0x80000000u: c->eax = 0x80000004u; break;
+    case 0x80000002u: case 0x80000003u: case 0x80000004u: {
+        const uint32_t *w = (const uint32_t *)(const void *)(brand + 16 * (leaf - 0x80000002u));
+        c->eax = w[0]; c->ebx = w[1]; c->ecx = w[2]; c->edx = w[3];
+        break; }
+    default: break;
+    }
+}
+
+/* RDTSC: a monotonic count standing in for the cycle counter, at a nominal
+ * 3 GHz so code that divides by a calibrated frequency sees sane numbers. */
+#include <time.h>
+static inline void rdtsc(CPU *c) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t t = (uint64_t)ts.tv_sec * 3000000000ull + (uint64_t)ts.tv_nsec * 3ull;
+    c->eax = (uint32_t)t; c->edx = (uint32_t)(t >> 32);
+}
+
+/* SSE2 integer helpers: lane-wise shifts with the hardware's rule that a
+ * count past the lane width clears it. */
+static inline uint64_t sse_sll64(uint64_t v, uint64_t n) { return n > 63 ? 0 : v << n; }
+static inline uint64_t sse_srl64(uint64_t v, uint64_t n) { return n > 63 ? 0 : v >> n; }
+static inline uint32_t sse_srl32(uint32_t v, uint64_t n) { return n > 31 ? 0 : v >> n; }
+
+/* FXSAVE/FXRSTOR. Control word and MXCSR are the defaults this model runs
+ * with (round to nearest, all exceptions masked); MXCSR_MASK is the full mask
+ * a Pentium 4 reports, DAZ included. The XMM registers round-trip. */
+static inline void fxsave(CPU *c, uint32_t a) {
+    for (uint32_t i = 0; i < 512; i += 4) wr32(a + i, 0);
+    wr32(a + 0, 0x027Fu | ((c->fpu_sw & 0xFFFFu) << 16));
+    wr32(a + 24, c->mxcsr ? c->mxcsr : 0x1F80u);
+    wr32(a + 28, 0xFFFFu);
+    for (int r = 0; r < 8; r++)
+        for (int k = 0; k < 4; k++) wr32(a + 160 + 16 * r + 4 * k, c->xmm[r].u32[k]);
+}
+static inline void fxrstor(CPU *c, uint32_t a) {
+    for (int r = 0; r < 8; r++)
+        for (int k = 0; k < 4; k++) c->xmm[r].u32[k] = rd32(a + 160 + 16 * r + 4 * k);
+}
 
 /* An instruction the lifter could not express. Plain abort() by default, so a
  * project that includes only cpu.h is unchanged; a runtime that can say
@@ -444,6 +505,7 @@ static inline void do_sahf(CPU *c, uint8_t ah) {
 static inline float  rdss(uint32_t a) { float  f; memcpy(&f, G2H(a), 4); return f; }
 static inline double rdsd(uint32_t a) { double d; memcpy(&d, G2H(a), 8); return d; }
 static inline XMM    rdxm(uint32_t a) { XMM x;    memcpy(&x, G2H(a), 16); return x; }
+static inline void   wrmm(uint32_t a, uint64_t v) { memcpy(G2H(a), &v, 8); }
 static inline void   wrss(uint32_t a, float  v) { memcpy(G2H(a), &v, 4); }
 static inline void   wrsd(uint32_t a, double v) { memcpy(G2H(a), &v, 8); }
 static inline void   wrxm(uint32_t a, XMM    v) { memcpy(G2H(a), &v, 16); }
