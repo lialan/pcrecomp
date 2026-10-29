@@ -1324,6 +1324,17 @@ class Lifter:
             # The Intel compiler's switch loads the arm first and jumps through
             # the register: `mov edx, [eax*4 + table]` then `jmp edx`. Same
             # table, one instruction later.
+            if ins.mnemonic == "jmp" and ins.operands and ins.operands[0].type == X86_OP_REG:
+                # the last write to the jump register: the compiler schedules
+                # the table load well before the jump
+                for back in reversed(seen[-40:]):
+                    try:
+                        _r, w = back.regs_access()
+                    except Exception:
+                        w = ()
+                    if ins.operands[0].reg in w:
+                        prev = back
+                        break
             if (ins.mnemonic == "jmp" and ins.operands and ins.operands[0].type == X86_OP_REG
                     and prev is not None and prev.mnemonic == "mov" and len(prev.operands) == 2
                     and prev.operands[0].type == X86_OP_REG and prev.operands[0].reg == ins.operands[0].reg
@@ -1331,7 +1342,8 @@ class Lifter:
                     and prev.operands[1].mem.scale == 4 and not prev.operands[1].mem.base
                     and self.in_image(prev.operands[1].mem.disp & 0xffffffff)):
                 table = prev.operands[1].mem.disp & 0xffffffff
-                slots = self.switch_slots(seen, prev.operands[1].mem.index)
+                slots = self.switch_slots(seen[:seen.index(prev)] if prev in seen else seen,
+                                          prev.operands[1].mem.index)
                 tgts = (self.resolve_slots(table, *slots) if slots
                         else self.resolve_jumptable(table))
                 if tgts:
