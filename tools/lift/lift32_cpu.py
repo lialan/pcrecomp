@@ -167,6 +167,18 @@ class Lifter:
         self.md = Cs(CS_ARCH_X86, CS_MODE_32)
         self.md.detail = True
 
+    def resolve_slots(self, table_va, first, count):
+        """Exactly `count` slots from `first`: the arms a bounded switch has."""
+        out = []
+        for i in range(first, first + count):
+            try:
+                t = int.from_bytes(self.read_va(table_va + 4 * i, 4), "little")
+            except Exception:
+                break
+            if self.in_image(t):
+                out.append(t)
+        return out
+
     def resolve_jumptable(self, table_va):
         """Read consecutive dword targets from a jump table.
 
@@ -218,6 +230,31 @@ class Lifter:
             else:
                 break
         return targets
+
+    def switch_slots(self, before, idx_reg):
+        """The slots a switch can index, from the range check before it:
+        `cmp r, N` / `ja` bounds the count, and `lea r, [idx - K]` (or the
+        check made on idx itself) the first slot. A table shared by two
+        switches is read from the right place only with these: indexing
+        from 0x105 means the first 0x105 dwords belong to someone else.
+        Returns (first, count) or None."""
+        n = k = None
+        for ins in reversed(before[-8:]):
+            m, ops = ins.mnemonic, ins.operands
+            if n is None and m == "cmp" and len(ops) == 2 and ops[1].type == X86_OP_IMM \
+                    and ops[0].type == X86_OP_REG:
+                n, cmp_reg = ops[1].imm & 0xffffffff, ops[0].reg
+                if cmp_reg == idx_reg:
+                    k = 0
+                    break
+                continue
+            if n is not None and m == "lea" and ops[0].type == X86_OP_REG and ops[0].reg == cmp_reg \
+                    and ops[1].type == X86_OP_MEM and ops[1].mem.base == idx_reg and not ops[1].mem.index:
+                k = (-ops[1].mem.disp) & 0xffffffff
+                break
+        if n is None or k is None or n > 4096 or k > 65536:
+            return None
+        return k, n + 1
 
     def in_image(self, a):
         return self.image_lo <= (a & 0xffffffff) < self.image_hi
@@ -1282,6 +1319,7 @@ class Lifter:
         insn_addrs = set(ins.address for ins in insns)   # only these can be goto labels
         labels = set()
         prev = None
+        seen = []
         for ins in insns:
             # The Intel compiler's switch loads the arm first and jumps through
             # the register: `mov edx, [eax*4 + table]` then `jmp edx`. Same
@@ -1292,11 +1330,15 @@ class Lifter:
                     and prev.operands[1].type == X86_OP_MEM and prev.operands[1].mem.index
                     and prev.operands[1].mem.scale == 4 and not prev.operands[1].mem.base
                     and self.in_image(prev.operands[1].mem.disp & 0xffffffff)):
-                tgts = self.resolve_jumptable(prev.operands[1].mem.disp & 0xffffffff)
+                table = prev.operands[1].mem.disp & 0xffffffff
+                slots = self.switch_slots(seen, prev.operands[1].mem.index)
+                tgts = (self.resolve_slots(table, *slots) if slots
+                        else self.resolve_jumptable(table))
                 if tgts:
                     self.jumptables[ins.address] = tgts
                     labels.update(t for t in tgts if t in insn_addrs)
             prev = ins
+            seen.append(ins)
             if ins.mnemonic.startswith("j") or ins.mnemonic in ("loop","loopne","loope","loopz","loopnz","loope"):
                 for op in ins.operands:
                     # only label real instruction boundaries; targets that land
@@ -1312,7 +1354,9 @@ class Lifter:
                         # thousands of branch targets out of hint RVAs.
                         if (op.mem.index and op.mem.scale == 4 and
                                 self.in_image(d)):
-                            tgts = self.resolve_jumptable(d)
+                            slots = self.switch_slots(seen[:-1], op.mem.index)
+                            tgts = (self.resolve_slots(d, *slots) if slots
+                                    else self.resolve_jumptable(d))
                             if tgts:
                                 self.jumptables[ins.address] = tgts
                                 # Only the arms that are instruction boundaries
