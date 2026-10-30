@@ -10,6 +10,15 @@
          "everything old is new again"
 ```
 
+## Thank you, sp00nznet
+
+This is a fork of [**sp00nznet/pcrecomp**](https://github.com/sp00nznet/pcrecomp).
+The tools, the runtime and everything below this section are
+[sp00nznet](https://github.com/sp00nznet)'s work; this fork's `macos-port`
+branch carries the changes behind
+[lialan/lindbergh-recomp-ports](https://github.com/lialan/lindbergh-recomp-ports)
+(macOS and Meta Quest). Thank you, sp00nznet, for building it and sharing it.
+
 **The unified toolbox for tearing apart old PC software and putting it back together, better.**
 
 This repo collects every tool, runtime, and hard-won trick from our PC static recompilation projects into one place. Next time we want to crack open a dusty `.exe` from 1995 and make it run on Windows 11, we start here.
