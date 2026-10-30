@@ -251,6 +251,23 @@ static inline void cpuid(CPU *c) {
 static inline void rdtsc(CPU *c) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* A thread polling the counter back to back is waiting for a deadline -
+     * a game's frame limiter spinning after its swap, say. Sleep a little
+     * between polls instead: the wait ends at most a few tens of
+     * microseconds late, and the core it burnt (a full one, on a headset
+     * that throttles when hot) is free. */
+    static __thread uint64_t last_ns;
+    static __thread unsigned streak;
+    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (ns - last_ns < 20000u) {
+        if (++streak >= 32) {
+            struct timespec nap = { 0, 50000 };
+            nanosleep(&nap, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        }
+    } else streak = 0;
+    last_ns = ns;
     uint64_t t = (uint64_t)ts.tv_sec * 3000000000ull + (uint64_t)ts.tv_nsec * 3ull;
     c->eax = (uint32_t)t; c->edx = (uint32_t)(t >> 32);
 }
