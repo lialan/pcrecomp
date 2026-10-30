@@ -95,7 +95,15 @@ typedef struct {
  * Every lifted memory access goes through G2H, so the generated code is the
  * same either way. */
 #ifdef RECOMP_GUEST_BASE
+#ifdef RECOMP_LIFTED
+/* Lifted code runs only once the window is set, and it never moves: const
+ * lets the compiler load it once per function. Otherwise every guest store
+ * - which might, for all the compiler knows, overwrite the pointer itself -
+ * is followed by a reload, about a tenth of a lifted function's instructions. */
+extern uint8_t *const g_guest_base;
+#else
 extern uint8_t *g_guest_base;
+#endif
 #define G2H(a) ((void *)(g_guest_base + (uint32_t)(a)))
 #else
 #define G2H(a) ((void *)(uintptr_t)(uint32_t)(a))
