@@ -39,6 +39,20 @@
  * genuinely IS 32-bit, and computing `addss` in double rounds once where the
  * hardware rounds twice. The results differ in the low bits, and in a game
  * that feeds them to a coordinate transform the difference is visible. */
+/* Whole-register views as the compiler's own vector types (NEON on arm64,
+ * SSE on x86): the lifter writes packed instructions as one vector expression
+ * on these. Lane loops over the arrays were left scalar by the optimiser -
+ * once the union is split into two 64-bit integers, `paddd` became masked
+ * integer adds and `psrldq` a chain of bitfield inserts. */
+typedef float    xv4f  __attribute__((vector_size(16)));
+typedef double   xv2d  __attribute__((vector_size(16)));
+typedef uint32_t xv4u  __attribute__((vector_size(16)));
+typedef int32_t  xv4i  __attribute__((vector_size(16)));
+typedef uint64_t xv2q  __attribute__((vector_size(16)));
+typedef int64_t  xv2qi __attribute__((vector_size(16)));
+typedef uint16_t xv8w  __attribute__((vector_size(16)));
+typedef int16_t  xv8h  __attribute__((vector_size(16)));
+typedef uint8_t  xv16b __attribute__((vector_size(16)));
 typedef union {
     float    f32[4];
     double   f64[2];
@@ -48,6 +62,7 @@ typedef union {
     uint16_t u16[8];
     int16_t  i16[8];
     uint8_t  u8[16];
+    xv4f vf; xv2d vd; xv4u vu; xv4i vi; xv2q vq; xv8w vw; xv8h vh; xv16b vb;
 } XMM;
 
 typedef struct {

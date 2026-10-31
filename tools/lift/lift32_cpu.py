@@ -1049,11 +1049,9 @@ class Lifter:
         if m in SSE_BITWISE:
             op = SSE_BITWISE[m]
             n = self._xi(d)
-            lanes = (f"c->xmm[{n}].u64[0] = ~c->xmm[{n}].u64[0] & _s.u64[0];"
-                     f" c->xmm[{n}].u64[1] = ~c->xmm[{n}].u64[1] & _s.u64[1];"
+            lanes = (f"c->xmm[{n}].vq = ~c->xmm[{n}].vq & _s.vq;"
                      if op == "andn" else
-                     f"c->xmm[{n}].u64[0] {op}= _s.u64[0];"
-                     f" c->xmm[{n}].u64[1] {op}= _s.u64[1];")
+                     f"c->xmm[{n}].vq {op}= _s.vq;")
             return [f"{{ XMM _s = {self._xm(insn, s)}; {lanes} }}"]
 
         # ---- scalar arithmetic ----
@@ -1077,16 +1075,19 @@ class Lifter:
             wide = m[-2:] == "pd"
             n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
             op = SSE_ARITH[m[:-2]]
-            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
-                    " c->xmm[%d].%s[_i] = c->xmm[%d].%s[_i] %s _s.%s[_i]; }"
-                    % (self._xm(insn, s), lanes, n, fld, n, fld, op, fld)]
+            v = "vd" if wide else "vf"
+            return ["{ XMM _s = %s; c->xmm[%d].%s = c->xmm[%d].%s %s _s.%s; }"
+                    % (self._xm(insn, s), n, v, n, v, op, v)]
         if m in ("minps", "maxps", "minpd", "maxpd"):
+            # dst < src ? dst : src (max: >), lane-wise, as a mask select:
+            # the same NaN and signed-zero answers as sse_minf/sse_maxf
             wide = m.endswith("pd")
-            n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
-            fn = "sse_%s%s" % (m[:3], "d" if wide else "f")
-            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
-                    " c->xmm[%d].%s[_i] = %s(c->xmm[%d].%s[_i], _s.%s[_i]); }"
-                    % (self._xm(insn, s), lanes, n, fld, fn, n, fld, fld)]
+            n = self._xi(d)
+            v, iv, mt = ("vd", "vq", "xv2q") if wide else ("vf", "vu", "xv4u")
+            cmp = "<" if m.startswith("min") else ">"
+            return ["{ XMM _s = %s; %s _m = (%s)(c->xmm[%d].%s %s _s.%s);"
+                    " c->xmm[%d].%s = (c->xmm[%d].%s & _m) | (_s.%s & ~_m); }"
+                    % (self._xm(insn, s), mt, mt, n, v, cmp, v, n, iv, n, iv, iv)]
         if m in ("sqrtps",):
             n = self._xi(d)
             return ["{ XMM _s = %s; for (int _i = 0; _i < 4; _i++)"
@@ -1101,18 +1102,14 @@ class Lifter:
             n = self._xi(d)
             imm = insn.operands[2].imm & 0xFF
             sel = [(imm >> 0) & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3]
-            return ["{ XMM _d = c->xmm[%d], _s = %s;"
-                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _d.f32[%d];"
-                    " c->xmm[%d].f32[2] = _s.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
-                    % (n, self._xm(insn, s), n, sel[0], n, sel[1], n, sel[2], n, sel[3])]
+            return ["{ XMM _s = %s; c->xmm[%d].vf = __builtin_shufflevector(c->xmm[%d].vf, _s.vf, %d, %d, %d, %d); }"
+                    % (self._xm(insn, s), n, n, sel[0], sel[1], 4 + sel[2], 4 + sel[3])]
         if m in ("unpcklps", "unpckhps"):
             n = self._xi(d)
             lo = m == "unpcklps"
             a, b = (0, 1) if lo else (2, 3)
-            return ["{ XMM _d = c->xmm[%d], _s = %s;"
-                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _s.f32[%d];"
-                    " c->xmm[%d].f32[2] = _d.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
-                    % (n, self._xm(insn, s), n, a, n, a, n, b, n, b)]
+            return ["{ XMM _s = %s; c->xmm[%d].vf = __builtin_shufflevector(c->xmm[%d].vf, _s.vf, %d, %d, %d, %d); }"
+                    % (self._xm(insn, s), n, n, a, 4 + a, b, 4 + b)]
 
         # ---- compares that set flags ----
         if m in ("ucomiss", "comiss", "ucomisd", "comisd"):
@@ -1177,8 +1174,8 @@ class Lifter:
             return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].u64[0] = c->xmm[{n}].u64[1]; c->xmm[{n}].u64[1] = _s.u64[1]; }}"]
         if m == "pshufd":
             n, imm = self._xi(d), ops[2].imm & 0xFF
-            return ["{ XMM _s = %s; %s }" % (x(s), " ".join(
-                f"c->xmm[{n}].u32[{i}] = _s.u32[{(imm >> (2 * i)) & 3}];" for i in range(4)))]
+            return ["{ XMM _s = %s; c->xmm[%d].vu = __builtin_shufflevector(_s.vu, _s.vu, %s); }"
+                    % (x(s), n, ", ".join(str((imm >> (2 * i)) & 3) for i in range(4)))]
         if m == "pshuflw":
             n, imm = self._xi(d), ops[2].imm & 0xFF
             return ["{ XMM _s = %s; %s c->xmm[%d].u64[1] = _s.u64[1]; }" % (x(s), " ".join(
@@ -1189,46 +1186,44 @@ class Lifter:
             return [self.dst_write(insn, d, f"(uint32_t)c->xmm[{self._xi(s)}].u16[{ops[2].imm & 7}]")]
         if m in ("paddd", "psubd", "paddw"):
             n = self._xi(d)
-            fld, k = ("u16", 8) if m == "paddw" else ("u32", 4)
+            v = "vw" if m == "paddw" else "vu"
             op = "-" if m == "psubd" else "+"
-            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < {k}; _i++)"
-                    f" c->xmm[{n}].{fld}[_i] = ({'uint16_t' if k == 8 else 'uint32_t'})(c->xmm[{n}].{fld}[_i] {op} _s.{fld}[_i]); }}"]
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].{v} = c->xmm[{n}].{v} {op} _s.{v}; }}"]
         if m == "pcmpeqd":
             n = self._xi(d)
-            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < 4; _i++)"
-                    f" c->xmm[{n}].u32[_i] = c->xmm[{n}].u32[_i] == _s.u32[_i] ? 0xFFFFFFFFu : 0u; }}"]
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].vu = (xv4u)(c->xmm[{n}].vu == _s.vu); }}"]
         if m in ("psllq", "psrlq", "psrld"):
             n = self._xi(d)
             cnt = f"{s.imm & 0xFF}u" if s.type == X86_OP_IMM else f"{x(s)}.u64[0]"
+            # a count past the lane width clears it, where C's shift is undefined
             if m == "psrld":
-                return [f"{{ uint64_t _n = {cnt}; for (int _i = 0; _i < 4; _i++)"
-                        f" c->xmm[{n}].u32[_i] = sse_srl32(c->xmm[{n}].u32[_i], _n); }}"]
-            fn = "sse_sll64" if m == "psllq" else "sse_srl64"
-            return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].u64[0] = {fn}(c->xmm[{n}].u64[0], _n);"
-                    f" c->xmm[{n}].u64[1] = {fn}(c->xmm[{n}].u64[1], _n); }}"]
+                return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].vu = _n > 31 ? (xv4u){{0}}"
+                        f" : c->xmm[{n}].vu >> (uint32_t)_n; }}"]
+            op = "<<" if m == "psllq" else ">>"
+            return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].vq = _n > 63 ? (xv2q){{0}}"
+                    f" : c->xmm[{n}].vq {op} _n; }}"]
         if m == "psrldq":
             n, k = self._xi(d), s.imm & 0xFF
-            return [f"{{ XMM _s = c->xmm[{n}]; for (int _i = 0; _i < 16; _i++)"
-                    f" c->xmm[{n}].u8[_i] = _i + {k} < 16 ? _s.u8[_i + {k}] : 0; }}"]
+            idx = ", ".join(str(i + k if i + k < 16 else 16) for i in range(16))
+            return [f"c->xmm[{n}].vb = __builtin_shufflevector(c->xmm[{n}].vb, (xv16b){{0}}, {idx});"]
         if m == "pslldq":
             n, k = self._xi(d), s.imm & 0xFF
-            return [f"{{ XMM _s = c->xmm[{n}]; for (int _i = 0; _i < 16; _i++)"
-                    f" c->xmm[{n}].u8[_i] = _i >= {k} ? _s.u8[_i - {k}] : 0; }}"]
+            idx = ", ".join(str(i - k if i >= k else 16) for i in range(16))
+            return [f"c->xmm[{n}].vb = __builtin_shufflevector(c->xmm[{n}].vb, (xv16b){{0}}, {idx});"]
         if m in ("punpcklbw", "punpcklwd", "punpckldq"):
             n = self._xi(d)
-            fld, k = {"punpcklbw": ("u8", 8), "punpcklwd": ("u16", 4), "punpckldq": ("u32", 2)}[m]
-            return [f"{{ XMM _d = c->xmm[{n}], _s = {x(s)}; for (int _i = 0; _i < {k}; _i++)"
-                    f" {{ c->xmm[{n}].{fld}[2 * _i] = _d.{fld}[_i]; c->xmm[{n}].{fld}[2 * _i + 1] = _s.{fld}[_i]; }} }}"]
+            v, k = {"punpcklbw": ("vb", 16), "punpcklwd": ("vw", 8), "punpckldq": ("vu", 4)}[m]
+            idx = ", ".join(f"{i // 2 + (k if i % 2 else 0)}" for i in range(k))
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].{v} = __builtin_shufflevector(c->xmm[{n}].{v}, _s.{v}, {idx}); }}"]
         if m == "haddps":
             n = self._xi(d)
-            return [f"{{ XMM _d = c->xmm[{n}], _s = {x(s)};"
-                    f" c->xmm[{n}].f32[0] = _d.f32[0] + _d.f32[1]; c->xmm[{n}].f32[1] = _d.f32[2] + _d.f32[3];"
-                    f" c->xmm[{n}].f32[2] = _s.f32[0] + _s.f32[1]; c->xmm[{n}].f32[3] = _s.f32[2] + _s.f32[3]; }}"]
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].vf = __builtin_shufflevector(c->xmm[{n}].vf, _s.vf, 0, 2, 4, 6)"
+                    f" + __builtin_shufflevector(c->xmm[{n}].vf, _s.vf, 1, 3, 5, 7); }}"]
         if m == "rcpss":
             return [f"{self._ss(insn, d)} = 1.0f / {self._ss(insn, s)};"]
         if m == "rcpps":
             n = self._xi(d)
-            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < 4; _i++) c->xmm[{n}].f32[_i] = 1.0f / _s.f32[_i]; }}"]
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].vf = 1.0f / _s.vf; }}"]
         if m == "pmovmskb":
             return [self.dst_write(insn, d, "({ uint32_t _m = 0; for (int _i = 0; _i < 16; _i++)"
                     f" _m |= (uint32_t)(c->xmm[{self._xi(s)}].u8[_i] >> 7) << _i; _m; }})")]
@@ -1243,7 +1238,9 @@ class Lifter:
         # to nearest (the default mode; the game never changes MXCSR) and
         # cvttps2dq truncates - the extra `t` is the whole difference and
         # getting it backwards is a silently wrong coordinate.
-        if m in ("cvtdq2ps", "cvtps2dq", "cvttps2dq"):
+        if m == "cvtdq2ps":
+            return [f"{{ XMM _s = {self._xm(insn, s)}; c->xmm[{self._xi(d)}].vf = __builtin_convertvector(_s.vi, xv4f); }}"]
+        if m in ("cvtps2dq", "cvttps2dq"):
             n, i = self._xi(d), None
             src = f"_s"
             body = []
