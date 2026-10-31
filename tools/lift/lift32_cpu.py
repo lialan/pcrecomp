@@ -88,7 +88,7 @@ SSE_CMP_PRED = {
     "nle":   "!(_a <= _b)",
     "ord":   "!(_a != _a || _b != _b)",
 }
-SSE_CMP_RE = re.compile(r"^cmp(%s)(ss|sd)$" % "|".join(SSE_CMP_PRED))
+SSE_CMP_RE = re.compile(r"^cmp(%s)(ss|sd|ps|pd)$" % "|".join(SSE_CMP_PRED))
 
 # Moves of the whole register. Aligned and unaligned differ only in whether the
 # hardware faults on a misaligned address; the movnt* forms differ only in a
@@ -103,7 +103,9 @@ SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdq
 # mistranslates string loops and MMX code into nonsense that still compiles.
 SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pandn",
                            "paddd", "psubd", "paddw", "pcmpeqd", "psllq", "psrlq", "psrld",
-                           "pinsrw", "pextrw", "punpcklbw", "punpcklwd", "punpckldq", "pmovmskb"})
+                           "pinsrw", "pextrw", "punpcklbw", "punpcklwd", "punpckldq", "pmovmskb",
+                           "paddq", "pmaddwd", "packssdw", "psrad", "psraw", "pslld",
+                           "paddsw", "psubsw", "pmulhw", "pmuludq", "pmaxsw"})
 
 SSE_MNEMONICS = (
     SSE_MOV128 | SSE_AMBIGUOUS | frozenset(SSE_BITWISE)
@@ -115,7 +117,7 @@ SSE_MNEMONICS = (
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
                  "cvtdq2ps", "cvtps2dq", "cvttps2dq",
                  "cvtps2pd", "cvtpd2ps", "movlpd", "movhps", "movhlps", "unpcklpd", "unpckhpd",
-                 "pshufd", "pshuflw", "psrldq", "pslldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd", "movmskps"})
+                 "pshufd", "pshuflw", "pshufhw", "movshdup", "psrldq", "pslldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd", "movmskps"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
@@ -401,6 +403,12 @@ class Lifter:
         def sz0(): return ops[0].size
 
         # ---- bit test and friends ----
+        if m in ("bsf", "bsr"):
+            d, s = two()
+            value = self.src(insn, s)
+            result = "(uint32_t)__builtin_ctz(_v)" if m == "bsf" else "31u - (uint32_t)__builtin_clz(_v)"
+            return [f"{{ uint32_t _v = {value}; c->zf = !_v; if (_v) {{ "
+                    + self.dst_write(insn, d, result) + " } }"]
         if m in ("bt", "bts", "btr", "btc"):
             opnum = {"bt": 0, "bts": 1, "btr": 2, "btc": 3}[m]
             d, s2 = ops[0], ops[1]
@@ -1120,6 +1128,12 @@ class Lifter:
         mm = SSE_CMP_RE.match(m)
         if mm:
             pred, width = mm.group(1), mm.group(2)
+            if width in ("ps", "pd"):
+                n, wide = self._xi(d), width == "pd"
+                fld, out, ctype, lanes = ("f64", "u64", "double", 2) if wide else ("f32", "u32", "float", 4)
+                return [f"{{ XMM _s = {self._xm(insn, s)}; for (int _i = 0; _i < {lanes}; _i++) {{"
+                        f" {ctype} _a = c->xmm[{n}].{fld}[_i], _b = _s.{fld}[_i];"
+                        f" c->xmm[{n}].{out}[_i] = {SSE_CMP_PRED[pred]} ? ~({ 'uint64_t' if wide else 'uint32_t' })0 : 0; }} }}"]
             wide = width == "sd"
             rd_ = self._sd if wide else self._ss
             ctype = "double" if wide else "float"
@@ -1180,25 +1194,60 @@ class Lifter:
             n, imm = self._xi(d), ops[2].imm & 0xFF
             return ["{ XMM _s = %s; %s c->xmm[%d].u64[1] = _s.u64[1]; }" % (x(s), " ".join(
                 f"c->xmm[{n}].u16[{i}] = _s.u16[{(imm >> (2 * i)) & 3}];" for i in range(4)), n)]
+        if m == "pshufhw":
+            n, imm = self._xi(d), ops[2].imm & 0xFF
+            return ["{ XMM _s = %s; c->xmm[%d].u64[0] = _s.u64[0]; %s }" % (x(s), n, " ".join(
+                f"c->xmm[{n}].u16[{i + 4}] = _s.u16[{4 + ((imm >> (2 * i)) & 3)}];" for i in range(4)))]
+        if m == "movshdup":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].vu = __builtin_shufflevector(_s.vu, _s.vu, 1, 1, 3, 3); }}"]
         if m == "pinsrw":
             return [f"c->xmm[{self._xi(d)}].u16[{ops[2].imm & 7}] = (uint16_t)({self.src(insn, s)});"]
         if m == "pextrw":
             return [self.dst_write(insn, d, f"(uint32_t)c->xmm[{self._xi(s)}].u16[{ops[2].imm & 7}]")]
-        if m in ("paddd", "psubd", "paddw"):
+        if m in ("paddd", "psubd", "paddw", "paddq"):
             n = self._xi(d)
-            v = "vw" if m == "paddw" else "vu"
+            v = "vw" if m == "paddw" else "vq" if m == "paddq" else "vu"
             op = "-" if m == "psubd" else "+"
             return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].{v} = c->xmm[{n}].{v} {op} _s.{v}; }}"]
         if m == "pcmpeqd":
             n = self._xi(d)
             return [f"{{ XMM _s = {x(s)}; c->xmm[{n}].vu = (xv4u)(c->xmm[{n}].vu == _s.vu); }}"]
-        if m in ("psllq", "psrlq", "psrld"):
+        if m in ("paddsw", "psubsw", "pmulhw", "pmaxsw"):
+            n = self._xi(d)
+            expr = {"paddsw": "_a + _b", "psubsw": "_a - _b",
+                    "pmulhw": "(_a * _b) >> 16", "pmaxsw": "_a > _b ? _a : _b"}[m]
+            return [f"{{ XMM _s = {x(s)}; for (int _i = 0; _i < 8; _i++) {{"
+                    f" int32_t _a = c->xmm[{n}].i16[_i], _b = _s.i16[_i], _v = {expr};"
+                    f" c->xmm[{n}].i16[_i] = (int16_t)(_v < -32768 ? -32768 : _v > 32767 ? 32767 : _v); }} }}"]
+        if m == "pmaddwd":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}, _d = c->xmm[{n}]; for (int _i = 0; _i < 4; _i++)"
+                    f" c->xmm[{n}].u32[_i] = (uint32_t)((int64_t)_d.i16[2*_i] * _s.i16[2*_i]"
+                    " + (int64_t)_d.i16[2*_i+1] * _s.i16[2*_i+1]); }"]
+        if m == "pmuludq":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}, _d = c->xmm[{n}]; for (int _i = 0; _i < 2; _i++)"
+                    f" c->xmm[{n}].u64[_i] = (uint64_t)_d.u32[2*_i] * _s.u32[2*_i]; }}"]
+        if m == "packssdw":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {x(s)}, _d = c->xmm[{n}]; for (int _i = 0; _i < 8; _i++) {{"
+                    " int32_t _v = _i < 4 ? _d.i32[_i] : _s.i32[_i-4];"
+                    f" c->xmm[{n}].i16[_i] = (int16_t)(_v < -32768 ? -32768 : _v > 32767 ? 32767 : _v); }} }}"]
+        if m in ("psrad", "psraw"):
+            n, bits = self._xi(d), 16 if m == "psraw" else 32
+            cnt = f"{s.imm & 0xFF}u" if s.type == X86_OP_IMM else f"{x(s)}.u64[0]"
+            fld = "i16" if bits == 16 else "i32"
+            return [f"{{ uint64_t _n = {cnt}; unsigned _k = _n >= {bits} ? {bits-1} : (unsigned)_n;"
+                    f" for (int _i = 0; _i < {128 // bits}; _i++) c->xmm[{n}].{fld}[_i] >>= _k; }}"]
+        if m in ("psllq", "psrlq", "psrld", "pslld"):
             n = self._xi(d)
             cnt = f"{s.imm & 0xFF}u" if s.type == X86_OP_IMM else f"{x(s)}.u64[0]"
             # a count past the lane width clears it, where C's shift is undefined
-            if m == "psrld":
+            if m in ("psrld", "pslld"):
+                op = "<<" if m == "pslld" else ">>"
                 return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].vu = _n > 31 ? (xv4u){{0}}"
-                        f" : c->xmm[{n}].vu >> (uint32_t)_n; }}"]
+                        f" : c->xmm[{n}].vu {op} (uint32_t)_n; }}"]
             op = "<<" if m == "psllq" else ">>"
             return [f"{{ uint64_t _n = {cnt}; c->xmm[{n}].vq = _n > 63 ? (xv2q){{0}}"
                     f" : c->xmm[{n}].vq {op} _n; }}"]
