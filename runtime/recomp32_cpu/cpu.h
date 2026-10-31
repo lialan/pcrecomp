@@ -95,7 +95,15 @@ typedef struct {
  * Every lifted memory access goes through G2H, so the generated code is the
  * same either way. */
 #ifdef RECOMP_GUEST_BASE
+#ifdef RECOMP_LIFTED
+/* Lifted code runs only once the window is set, and it never moves: const
+ * lets the compiler load it once per function. Otherwise every guest store
+ * - which might, for all the compiler knows, overwrite the pointer itself -
+ * is followed by a reload, about a tenth of a lifted function's instructions. */
+extern uint8_t *const g_guest_base;
+#else
 extern uint8_t *g_guest_base;
+#endif
 #define G2H(a) ((void *)(g_guest_base + (uint32_t)(a)))
 #else
 #define G2H(a) ((void *)(uintptr_t)(uint32_t)(a))
@@ -111,6 +119,32 @@ static inline uint64_t mm_w4(int32_t w0, int32_t w1, int32_t w2, int32_t w3)
 { return (uint64_t)(uint16_t)w0 | (uint64_t)(uint16_t)w1 << 16 | (uint64_t)(uint16_t)w2 << 32 | (uint64_t)(uint16_t)w3 << 48; }
 static inline uint64_t mm_d2(int32_t d0, int32_t d1) { return (uint64_t)(uint32_t)d0 | (uint64_t)(uint32_t)d1 << 32; }
 static inline int32_t mm_sat16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+#if defined(__aarch64__) && !defined(RECOMP_MMX_SCALAR)
+/* On an ARM64 host each of these is a NEON instruction or two; the portable
+ * versions below cost a dozen scalar shifts and masks apiece, which made CRI's
+ * MMX IDCT the single largest cost of a movie playing on the Quest. Same
+ * results, lane for lane (RECOMP_MMX_SCALAR selects the portable ones). */
+#include <arm_neon.h>
+#define MM_S16(v) vreinterpret_s16_u64(vcreate_u64(v))
+#define MM_S32(v) vreinterpret_s32_u64(vcreate_u64(v))
+#define MM_U64(x) vget_lane_u64(vreinterpret_u64_##x, 0)
+static inline uint64_t mmx_paddd(uint64_t a, uint64_t b) { int32x2_t r = vadd_s32(MM_S32(a), MM_S32(b)); return MM_U64(s32(r)); }
+static inline uint64_t mmx_psubd(uint64_t a, uint64_t b) { int32x2_t r = vsub_s32(MM_S32(a), MM_S32(b)); return MM_U64(s32(r)); }
+static inline uint64_t mmx_paddsw(uint64_t a, uint64_t b) { int16x4_t r = vqadd_s16(MM_S16(a), MM_S16(b)); return MM_U64(s16(r)); }
+static inline uint64_t mmx_psubsw(uint64_t a, uint64_t b) { int16x4_t r = vqsub_s16(MM_S16(a), MM_S16(b)); return MM_U64(s16(r)); }
+static inline uint64_t mmx_pmulhw(uint64_t a, uint64_t b)
+{   int32x4_t p = vmull_s16(MM_S16(a), MM_S16(b)); int16x4_t r = vshrn_n_s32(p, 16); return MM_U64(s16(r)); }
+static inline uint64_t mmx_pmaddwd(uint64_t a, uint64_t b)
+{   /* pairwise sums of the four products; 0x8000*0x8000*2 wraps, as on hardware */
+    int32x4_t p = vmull_s16(MM_S16(a), MM_S16(b));
+    int32x2_t r = vpadd_s32(vget_low_s32(p), vget_high_s32(p)); return MM_U64(s32(r)); }
+static inline uint64_t mmx_packssdw(uint64_t a, uint64_t b)
+{   int16x4_t r = vqmovn_s32(vcombine_s32(MM_S32(a), MM_S32(b))); return MM_U64(s16(r)); }
+static inline uint64_t mmx_psrad(uint64_t a, uint64_t n)
+{   int k = n > 31 ? 31 : (int)n; int32x2_t r = vshl_s32(MM_S32(a), vdup_n_s32(-k)); return MM_U64(s32(r)); }
+static inline uint64_t mmx_psraw(uint64_t a, uint64_t n)
+{   int k = n > 15 ? 15 : (int)n; int16x4_t r = vshl_s16(MM_S16(a), vdup_n_s16((int16_t)-k)); return MM_U64(s16(r)); }
+#else
 static inline uint64_t mmx_paddd(uint64_t a, uint64_t b) { return mm_d2((int32_t)((uint32_t)mmd(a,0) + (uint32_t)mmd(b,0)), (int32_t)((uint32_t)mmd(a,1) + (uint32_t)mmd(b,1))); }
 static inline uint64_t mmx_psubd(uint64_t a, uint64_t b) { return mm_d2((int32_t)((uint32_t)mmd(a,0) - (uint32_t)mmd(b,0)), (int32_t)((uint32_t)mmd(a,1) - (uint32_t)mmd(b,1))); }
 static inline uint64_t mmx_paddsw(uint64_t a, uint64_t b) { return mm_w4(mm_sat16(mmw(a,0)+mmw(b,0)), mm_sat16(mmw(a,1)+mmw(b,1)), mm_sat16(mmw(a,2)+mmw(b,2)), mm_sat16(mmw(a,3)+mmw(b,3))); }
@@ -123,6 +157,7 @@ static inline uint64_t mmx_pmaddwd(uint64_t a, uint64_t b)
 static inline uint64_t mmx_packssdw(uint64_t a, uint64_t b) { return mm_w4(mm_sat16(mmd(a,0)), mm_sat16(mmd(a,1)), mm_sat16(mmd(b,0)), mm_sat16(mmd(b,1))); }
 static inline uint64_t mmx_psrad(uint64_t a, uint64_t n) { int k = n > 31 ? 31 : (int)n; return mm_d2(mmd(a,0) >> k, mmd(a,1) >> k); }
 static inline uint64_t mmx_psraw(uint64_t a, uint64_t n) { int k = n > 15 ? 15 : (int)n; return mm_w4(mmw(a,0) >> k, mmw(a,1) >> k, mmw(a,2) >> k, mmw(a,3) >> k); }
+#endif
 static inline uint64_t mmx_por(uint64_t a, uint64_t b) { return a | b; }
 static inline uint64_t mmx_pshufw(uint64_t b, unsigned imm) { return mm_w4(mmw(b, imm & 3), mmw(b, (imm >> 2) & 3), mmw(b, (imm >> 4) & 3), mmw(b, (imm >> 6) & 3)); }
 static inline uint64_t mmx_pinsrw(uint64_t a, uint32_t v, unsigned imm) { int i = imm & 3; return (a & ~(0xFFFFull << (16 * i))) | (uint64_t)(uint16_t)v << (16 * i); }
@@ -216,6 +251,23 @@ static inline void cpuid(CPU *c) {
 static inline void rdtsc(CPU *c) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* A thread polling the counter back to back is waiting for a deadline -
+     * a game's frame limiter spinning after its swap, say. Sleep a little
+     * between polls instead: the wait ends at most a few tens of
+     * microseconds late, and the core it burnt (a full one, on a headset
+     * that throttles when hot) is free. */
+    static __thread uint64_t last_ns;
+    static __thread unsigned streak;
+    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (ns - last_ns < 20000u) {
+        if (++streak >= 32) {
+            struct timespec nap = { 0, 50000 };
+            nanosleep(&nap, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        }
+    } else streak = 0;
+    last_ns = ns;
     uint64_t t = (uint64_t)ts.tv_sec * 3000000000ull + (uint64_t)ts.tv_nsec * 3ull;
     c->eax = (uint32_t)t; c->edx = (uint32_t)(t >> 32);
 }

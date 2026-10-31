@@ -115,7 +115,7 @@ SSE_MNEMONICS = (
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
                  "cvtdq2ps", "cvtps2dq", "cvttps2dq",
                  "cvtps2pd", "cvtpd2ps", "movlpd", "movhps", "movhlps", "unpcklpd", "unpckhpd",
-                 "pshufd", "pshuflw", "psrldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd"})
+                 "pshufd", "pshuflw", "psrldq", "pslldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
@@ -798,6 +798,13 @@ class Lifter:
             sz = memop.size; a = self.addr_expr(insn, memop)
             st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
             return [f"{st}({a}, *fst(c, 0)){pop}"]
+        if m == "fisttp":
+            # SSE3's store-and-pop that truncates whatever the rounding mode:
+            # the value is already integral after trunc(), so the store's own
+            # rounding leaves it alone.
+            sz = memop.size; a = self.addr_expr(insn, memop)
+            st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
+            return [f"{st}({a}, trunc(*fst(c, 0))); fpop(c);"]
         if m in ("fprem", "fprem1"):
             return ["*fst(c, 0) = fprem_op(c, *fst(c, 0), *fst(c, 1));"]
         if m.startswith("fcmov"):
@@ -1203,6 +1210,10 @@ class Lifter:
             n, k = self._xi(d), s.imm & 0xFF
             return [f"{{ XMM _s = c->xmm[{n}]; for (int _i = 0; _i < 16; _i++)"
                     f" c->xmm[{n}].u8[_i] = _i + {k} < 16 ? _s.u8[_i + {k}] : 0; }}"]
+        if m == "pslldq":
+            n, k = self._xi(d), s.imm & 0xFF
+            return [f"{{ XMM _s = c->xmm[{n}]; for (int _i = 0; _i < 16; _i++)"
+                    f" c->xmm[{n}].u8[_i] = _i >= {k} ? _s.u8[_i - {k}] : 0; }}"]
         if m in ("punpcklbw", "punpcklwd", "punpckldq"):
             n = self._xi(d)
             fld, k = {"punpcklbw": ("u8", 8), "punpcklwd": ("u16", 4), "punpckldq": ("u32", 2)}[m]
