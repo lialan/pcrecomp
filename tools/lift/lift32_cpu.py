@@ -115,7 +115,7 @@ SSE_MNEMONICS = (
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
                  "cvtdq2ps", "cvtps2dq", "cvttps2dq",
                  "cvtps2pd", "cvtpd2ps", "movlpd", "movhps", "movhlps", "unpcklpd", "unpckhpd",
-                 "pshufd", "pshuflw", "psrldq", "pslldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd"})
+                 "pshufd", "pshuflw", "psrldq", "pslldq", "lddqu", "haddps", "rcpss", "rcpps", "movmskpd", "movmskps"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
@@ -1230,6 +1230,10 @@ class Lifter:
         if m == "movmskpd":
             n = self._xi(s)
             return [self.dst_write(insn, d, f"(uint32_t)((c->xmm[{n}].u64[0] >> 63) | ((c->xmm[{n}].u64[1] >> 63) << 1))")]
+        if m == "movmskps":
+            n = self._xi(s)
+            return [self.dst_write(insn, d, "(" + " | ".join(
+                f"((c->xmm[{n}].u32[{i}] >> 31) << {i})" for i in range(4)) + ")")]
 
         # ---- packed conversions ----
         #
