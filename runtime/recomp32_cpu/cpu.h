@@ -79,6 +79,7 @@ typedef struct {
      * here mixes the two without an emms between, so they are kept apart. */
     uint64_t mm[8];
     uint32_t fpu_sw;   /* status word: only C0/C1/C2/C3 condition bits modelled */
+    uint32_t fpu_cw_x; /* control word XOR 0x027F, so a zeroed CPU has the default: only RC is modelled */
     /* Segment registers: stored, but NOT used in address computation. The
      * memory model below is flat - a register holds a real 32-bit address - so
      * `mov ds, ax` records the selector and does nothing else. That is right
@@ -298,7 +299,7 @@ static inline uint32_t sse_srl32(uint32_t v, uint64_t n) { return n > 31 ? 0 : v
  * a Pentium 4 reports, DAZ included. The XMM registers round-trip. */
 static inline void fxsave(CPU *c, uint32_t a) {
     for (uint32_t i = 0; i < 512; i += 4) wr32(a + i, 0);
-    wr32(a + 0, 0x027Fu | ((c->fpu_sw & 0xFFFFu) << 16));
+    wr32(a + 0, ((c->fpu_cw_x ^ 0x027Fu) & 0xFFFFu) | ((c->fpu_sw & 0xFFFFu) << 16));
     wr32(a + 24, c->mxcsr ? c->mxcsr : 0x1F80u);
     wr32(a + 28, 0xFFFFu);
     for (int r = 0; r < 8; r++)
@@ -531,6 +532,21 @@ static inline void   wrf64(uint32_t a, double v) { memcpy(G2H(a), &v, 8); }
 static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyint(v); memcpy(G2H(a), &i, 4); }
 static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); memcpy(G2H(a), &i, 2); }
 static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); memcpy(G2H(a), &i, 8); }
+
+/* The x87 rounding control (control word bits 10-11), which frndint and the
+ * integer stores obey. GCC brackets every (int) cast with fldcw to truncate,
+ * and libCg rounds log2 up to size its arrays: rounding to nearest whatever
+ * the mode made those too small, and the copy into one wrecked the heap. */
+static inline uint32_t fpu_cw(const CPU *c) { return (c->fpu_cw_x ^ 0x027Fu) & 0xFFFFu; }
+static inline void fpu_set_cw(CPU *c, uint32_t cw) { c->fpu_cw_x = (cw & 0xFFFFu) ^ 0x027Fu; }
+static inline double fpu_round(const CPU *c, double v) {
+    switch ((fpu_cw(c) >> 10) & 3u) {
+    case 1:  return floor(v);
+    case 2:  return ceil(v);
+    case 3:  return trunc(v);
+    default: return nearbyint(v);
+    }
+}
 
 /* fcom/fcomp: set C3/C2/C0 (st0 vs v). Cleared C1. */
 static inline void fcompare(CPU *c, double a, double b) {

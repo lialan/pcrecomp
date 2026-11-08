@@ -8,7 +8,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_GRP_JUMP, CS_GRP_CALL, CS_GRP_RET, CS_GRP_INT
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG, X86_REG_EBX
 
 
 # Conditional jump mnemonics
@@ -277,19 +277,31 @@ class Disassembler:
 
         Callers must iterate the result at most once.
         """
-        data = self.read_bytes(va, max_bytes)
-        if data is None:
-            return
-
-        for insn in self.md.disasm(data, va):
-            yield Instruction(
-                address=insn.address,
-                size=insn.size,
-                mnemonic=insn.mnemonic,
-                op_str=insn.op_str,
-                bytes=bytes(insn.bytes),
-                operands=list(insn.operands) if insn.operands else [],
-            )
+        off = 0
+        step = 128
+        while off < max_bytes:
+            chunk_len = min(step + 15, max_bytes - off)
+            data = self.read_bytes(va + off, chunk_len)
+            if not data:
+                return
+            progressed = False
+            for insn in self.md.disasm(data, va + off):
+                if insn.address - va >= max_bytes:
+                    return
+                if insn.address - (va + off) >= step and off + step < max_bytes:
+                    break
+                progressed = True
+                off = (insn.address - va) + insn.size
+                yield Instruction(
+                    address=insn.address,
+                    size=insn.size,
+                    mnemonic=insn.mnemonic,
+                    op_str=insn.op_str,
+                    bytes=bytes(insn.bytes),
+                    operands=list(insn.operands) if insn.operands else [],
+                )
+            if not progressed:
+                return
 
     def jump_table_targets(self, insn, limit: int = 256) -> list:
         """Entries of the jump table an indirect `jmp` dispatches through.
@@ -330,6 +342,41 @@ class Disassembler:
                 break
         return out
 
+    # Instructions that set the flags: a `cmp r, imm` before one of these no
+    # longer bounds the `ja` after it.
+    FLAG_WRITERS = frozenset((
+        'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'test', 'cmp', 'inc', 'dec', 'neg',
+        'shl', 'sal', 'shr', 'sar', 'rol', 'ror', 'rcl', 'rcr', 'shld', 'shrd', 'imul', 'mul',
+        'idiv', 'div', 'bt', 'bts', 'btr', 'btc', 'bsf', 'bsr', 'sahf', 'popf', 'popfd',
+        'cmpxchg', 'xadd', 'scasb', 'scasd', 'cmpsb', 'cmpsd', 'call'))
+
+    # The GOT address a shared object's code holds in ebx (solib.py sets it).
+    pic_base = None
+
+    def pic_jump_table_targets(self, load, count: int) -> list:
+        """Arms of a GCC PIC switch: `mov ecx, ebx; sub ecx, [ebx + i*4 + d];
+        jmp ecx` (each entry is GOT - arm) or `mov eax, [ebx + i*4 + d]; add
+        eax, ebx; jmp eax` (GOT + arm). The table is at GOT + d, often in .text
+        right after the jmp. `count` comes from the bounds check before it;
+        without one, read until an entry is not code."""
+        op, disp = load
+        table = (self.pic_base + disp) & 0xFFFFFFFF
+        out = []
+        for k in range(count or 1024):
+            raw = self.read_bytes(table + 4 * k, 4)
+            if not raw or len(raw) < 4:
+                break
+            if table + 4 * k in out:
+                break            # the table has run into one of its own arms
+            e = int.from_bytes(raw, 'little')
+            tgt = (self.pic_base - e if op == 'sub' else self.pic_base + e) & 0xFFFFFFFF
+            if not self.is_code_address(tgt):
+                if count:
+                    continue
+                break
+            out.append(tgt)
+        return out
+
     def disassemble_function(self, start_va: int, iat_map: dict = None) -> Optional[Function]:
         """
         Disassemble a complete function using recursive descent from start_va.
@@ -342,6 +389,7 @@ class Disassembler:
         visited = set()
         work = [start_va]
         block_leaders = {start_va}
+        case_bound = {}          # leader -> entries the switch after it indexes
 
         # Pass 1: discover all block leaders
         while work:
@@ -350,8 +398,26 @@ class Disassembler:
                 continue
             visited.add(addr)
 
-            insns = self.disassemble_at(addr, max_bytes=8192)
+            # The same window as pass 2's blocks. A straight run longer than
+            # it (libCg's 0x4e0bc: thousands of bytes of push/call, no branch)
+            # carries on as a new leader below, instead of the rest of the
+            # function being dropped.
+            insns = self.disassemble_at(addr, max_bytes=4096)
+            last = prev = None
+            pic_load = None          # `sub/add/mov r, [ebx + i*4 + disp]` in this run
+            bound_cmp = None         # the last `cmp r, imm` whose flags still stand
             for insn in insns:
+                prev, last = last, insn
+                if insn.mnemonic == 'cmp' and len(insn.operands or ()) == 2 \
+                        and insn.operands[1].type == X86_OP_IMM:
+                    bound_cmp = insn
+                elif insn.mnemonic in self.FLAG_WRITERS:
+                    bound_cmp = None
+                if self.pic_base is not None and insn.mnemonic in ('sub', 'add', 'mov') \
+                        and len(insn.operands or ()) == 2:
+                    m = insn.operands[1]
+                    if m.type == X86_OP_MEM and m.mem.base == X86_REG_EBX and m.mem.scale == 4 and m.mem.index:
+                        pic_load = (insn.mnemonic, m.mem.disp)
                 if insn.is_call:
                     target = insn.get_branch_target()
                     if target and self.is_code_address(target):
@@ -368,6 +434,12 @@ class Disassembler:
                             block_leaders.add(target)
                             if target not in visited:
                                 work.append(target)
+                    # `cmp i, n; ja default`: what follows indexes n+1 entries
+                    # (GCC can schedule movs between the cmp and the ja: libCg 0xfe2a1)
+                    if insn.mnemonic in ('ja', 'jae') and bound_cmp is not None:
+                        n = bound_cmp.operands[1].imm & 0xFFFFFFFF
+                        if n < 4096:
+                            case_bound[insn.end_address] = n + (1 if insn.mnemonic == 'ja' else 0)
                     # Fallthrough is also a leader
                     fallthrough = insn.end_address
                     block_leaders.add(fallthrough)
@@ -384,6 +456,13 @@ class Disassembler:
                                 work.append(target)
                     elif target is None:
                         func.jump_targets.update(self.jump_table_targets(insn))
+                        if pic_load is not None and insn.operands and insn.operands[0].type != X86_OP_MEM:
+                            arms = self.pic_jump_table_targets(pic_load, case_bound.get(addr, 0))
+                            func.jump_targets.update(arms)
+                            if arms:   # where the table sits: data, not code
+                                n = case_bound.get(addr, 0) or len(arms)
+                                tab = (self.pic_base + pic_load[1]) & 0xFFFFFFFF
+                                func.pic_tables = getattr(func, 'pic_tables', []) + [(tab, tab + 4 * n)]
                         # `jmp dword ptr [table + idx*4]` -- a switch. The arms
                         # belong to THIS function: they are its loop body, not
                         # tail calls, so they have to become blocks here. Lift
@@ -401,6 +480,13 @@ class Disassembler:
                 # Check for int 3 (padding/alignment)
                 if insn.mnemonic == 'int3':
                     break
+            else:
+                # the window ran out mid-run: what follows is this function too
+                if (last is not None and last.end_address - addr >= 4096 - 15
+                        and self.is_code_address(last.end_address)):
+                    block_leaders.add(last.end_address)
+                    if last.end_address not in visited:
+                        work.append(last.end_address)
 
         # Pass 2: build basic blocks
         all_leaders = sorted(block_leaders)
@@ -584,7 +670,7 @@ class Disassembler:
             for offset in range(len(data) - 3):
                 va = code_start + offset
                 # push ebp; mov ebp, esp (55 8B EC)
-                if data[offset:offset + 3] == b'\x55\x8B\xEC':
+                if data[offset:offset + 3] in (b'\x55\x8B\xEC', b'\x55\x89\xE5'):
                     prologue_targets.add(va)
                 # push ebp; mov ebp, esp with sub esp (55 8B EC 83 EC)
                 # Also push esi; push edi patterns after push ebp

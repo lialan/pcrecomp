@@ -662,6 +662,18 @@ class Lifter:
             return [body]
 
         # stack
+        # A 16-bit push/pop (66 50, `push ax`) moves esp by two. Lifted as the
+        # 32-bit form it moved by four: libCg passes a short argument with
+        # `sub esp, 2; push ax`, and every argument above it was read two
+        # bytes off (cgCreateProgram's profile went in as garbage).
+        o16 = m in ("push", "pop") and 0x66 in insn.prefix   # not `push es`: that moves esp by four
+        if m == "push" and o16:
+            return [f"{{ uint16_t _w = (uint16_t)({self.src(insn, ops[0])}); c->esp -= 2; wr16(c->esp, _w); }}"]
+        if m == "pop" and o16:
+            d = ops[0]
+            val = "(c->esp += 2, rd16(c->esp - 2))"
+            if d.type == X86_OP_REG: return [reg_write(self.md.reg_name(d.reg), val)]
+            return [self.wr(insn, d, val)]
         if m == "push":
             return [f"push32(c, {self.src(insn, ops[0])});"]
         if m == "pop":
@@ -805,7 +817,7 @@ class Lifter:
             pop = "; fpop(c);" if m == "fistp" else ";"
             sz = memop.size; a = self.addr_expr(insn, memop)
             st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
-            return [f"{st}({a}, *fst(c, 0)){pop}"]
+            return [f"{st}({a}, fpu_round(c, *fst(c, 0))){pop}"]
         if m == "fisttp":
             # SSE3's store-and-pop that truncates whatever the rounding mode:
             # the value is already integral after trunc(), so the store's own
@@ -833,7 +845,7 @@ class Lifter:
         if m in ("fcos",):  return ["*fst(c, 0) = cos(*fst(c, 0));"]
         if m in ("fptan",): return ["*fst(c, 0) = tan(*fst(c, 0)); fpush(c, 1.0);"]
         if m in ("fpatan",):return ["*fst(c, 1) = atan2(*fst(c, 1), *fst(c, 0)); fpop(c);"]
-        if m in ("frndint",): return ["*fst(c, 0) = nearbyint(*fst(c, 0));"]
+        if m in ("frndint",): return ["*fst(c, 0) = fpu_round(c, *fst(c, 0));"]
         if m in ("fscale",): return ["*fst(c, 0) = ldexp(*fst(c, 0), (int)*fst(c, 1));"]
         if m in ("fsincos",): return ["{ double _s=sin(*fst(c,0)), _c=cos(*fst(c,0)); *fst(c,0)=_s; fpush(c,_c); }"]
         if m in ("fxch",):
@@ -916,8 +928,12 @@ class Lifter:
         if m in ("fxsave", "fxrstor"):
             return [f"{m}(c, {self.addr_expr(insn, ops[0])});"]
         if m == "fnstcw":
-            return [self.wr(insn, ops[0], "0x027Fu")]   # default control word
-        if m in ("fldcw", "fwait", "wait", "fnclex", "fclex", "fninit"):
+            return [self.wr(insn, ops[0], "fpu_cw(c)")]
+        if m == "fldcw":
+            return [f"fpu_set_cw(c, {self.src(insn, ops[0])});"]
+        if m == "fninit":
+            return ["fpu_set_cw(c, 0x037Fu);"]
+        if m in ("fwait", "wait", "fnclex", "fclex"):
             return [f"/* {m} ignored */"]
         if m in ("fldenv", "fnstenv"):
             return [f"/* {m} ignored (no FP exceptions modelled) */"]
